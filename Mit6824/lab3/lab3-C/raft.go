@@ -9,6 +9,7 @@ package raft
 import (
 	//	"bytes"
 
+	"bytes"
 	"math/rand"
 	"sync"
 	"sync/atomic"
@@ -16,6 +17,7 @@ import (
 
 	//	"6.5840/labgob"
 
+	"6.5840/labgob"
 	"6.5840/labrpc"
 	"6.5840/raftapi"
 	tester "6.5840/tester1"
@@ -95,12 +97,15 @@ func (rf *Raft) GetState() (int, bool) {
 func (rf *Raft) persist() {
 	// Your code here (3C).
 	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// raftstate := w.Bytes()
-	// rf.persister.Save(raftstate, nil)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.term)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.log)
+	//DPrintfln("[C]", ColorBlue, "persist  term:%d voteful:%v  loglen:%d,     %d\n", rf.term, rf.votedFor, rf.lastApplied, len(rf.log[:rf.lastApplied+1]))
+	DPrintfln("[C]", ColorBlue, "persist name:%d term:%d voteful:%v  loglen:%d  \n", rf.me, rf.term, rf.votedFor, len(rf.log))
+	raftstate := w.Bytes()
+	rf.persister.Save(raftstate, nil)
 }
 
 // restore previously persisted state.
@@ -110,17 +115,25 @@ func (rf *Raft) readPersist(data []byte) {
 	}
 	// Your code here (3C).
 	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var term int
+	var voteFor int
+	var log []Log
+
+	if d.Decode(&term) != nil ||
+		d.Decode(&voteFor) != nil || d.Decode(&log) != nil {
+		panic("readPersist: decode error")
+	} else {
+		rf.lock_.Lock()
+		rf.term = term
+		rf.votedFor = voteFor
+		rf.log = log
+		//DPrintfln("[C]", ColorBlue, "read  term:%d voteful:%v  loglen:%d\n", rf.term, rf.votedFor, rf.lastApplied)
+		DPrintfln("[C]", ColorBlue, "read name:%d term:%d voteful:%v  loglen:%d\n", rf.me, rf.term, rf.votedFor, len(rf.log))
+
+		rf.lock_.Unlock()
+	}
 }
 
 // how many bytes in Raft's persisted log?
@@ -168,11 +181,11 @@ func (rf *Raft) RequestVoteHelper() {
 			return
 		}
 		rf.term++
-		rf.votedFor = -1
 		//DPrintfln("[G]", ColorGreen, "term:%d have chance to be leader name%d\n", rf.term, rf.me)
 
 		n := 1
 		rf.votedFor = rf.me
+		rf.persist()
 		args := RequestVoteArgs{
 			Term:         rf.term,
 			CandidateId:  rf.me,
@@ -203,6 +216,7 @@ func (rf *Raft) RequestVoteHelper() {
 						rf.term = reply.Term
 						rf.state = Follower
 						rf.votedFor = -1
+						rf.persist()
 						//DPrintfln("[C]", ColorRed, "name:%d args term:%d   rf.term:%d    become follower%v\n", rf.me, args.Term, rf.term)
 						rf.lock_.Unlock()
 						return
@@ -234,6 +248,7 @@ func (rf *Raft) RequestVoteHelper() {
 	}
 }
 
+// tttag
 // example RequestVote RPC handler.
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (3A, 3B).
@@ -242,10 +257,13 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.lock_.Lock()
 	defer rf.lock_.Unlock()
 
+	flag := false
 	if args.Term > rf.term {
 		rf.state = Follower
 		rf.term = args.Term
 		rf.votedFor = -1
+		flag = true
+		// rf.persist()
 	}
 
 	reply.Term = rf.term
@@ -261,10 +279,14 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	lastTerm := rf.log[lastIndex].Term
 	if args.LastLogTerm < lastTerm || (args.LastLogTerm == lastTerm && args.LastLogIndex < lastIndex) {
 		reply.VoteGranted = false
+		if flag {
+			rf.persist()
+		}
 		return
 	}
 	rf.votedFor = args.CandidateId
 	reply.VoteGranted = true
+	rf.persist()
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -330,8 +352,13 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader = rf.state == Leader
 	if isLeader {
 		rf.log = append(rf.log, Log{Term: rf.term, Cmd: command})
-		// DPrintfln("[C]", ColorGreen, "insert log term:%d    name:%d   isLeader:%v .  cmd:%v \n", rf.term, rf.me, isLeader, command)
+		DPrintfln("[C]", ColorGreen, "insert log term:%d    name:%d   isLeader:%v .  cmd:%v \n", rf.term, rf.me, isLeader, command)
 		// DPrintfln("[C]", ColorGreen, "insert log term:%d    name:%d   isLeader:%v .  cmd \n", rf.term, rf.me, isLeader)
+		last := len(rf.log) - 1
+		// rf.matchIndex[rf.me] = last
+		rf.nextIndex[rf.me] = last + 1
+
+		rf.persist()
 	}
 
 	index = len(rf.log) - 1
@@ -362,7 +389,9 @@ func (rf *Raft) killed() bool {
 }
 
 func (rf *Raft) ticker() {
+	rf.lock_.Lock()
 	rf.time_ = time.Now()
+	rf.lock_.Unlock()
 	for rf.killed() == false {
 
 		// Your code here (3A)
@@ -426,7 +455,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	}
 
 	// Your initialization code here (3A, 3B, 3C).
-	DPrintfln("[C]", ColorBlue, "   Make a new Raft\n")
+	DPrintfln("[C]", ColorBlue, "   Make a new Raft%d\n", rf.me)
 	//go rf.RequestVoteHelper()
 
 	// initialize from state persisted before a crash
@@ -450,11 +479,19 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply struct {
 	Term    int
 	Success bool
+	XTerm   int
+	XIndex  int
+	XLen    int
 }
 
 func (rf *Raft) startLearder() {
 
-	// DPrintfln("[C]", ColorRed, "   start a Leader state: %d   name:%d   term :%d\n", rf.state, rf.me, rf.term)
+	DPrintfln("[C]", ColorRed, "   start a Leader state: %d   name:%d   term :%d\n", rf.state, rf.me, rf.term)
+	rf.lock_.Lock()
+	for i, _ := range rf.nextIndex {
+		rf.nextIndex[i] = len(rf.log)
+	}
+	rf.lock_.Unlock()
 	go rf.pushToFollowers()
 	for rf.killed() == false {
 		rf.lock_.Lock()
@@ -465,41 +502,64 @@ func (rf *Raft) startLearder() {
 		rf.time_ = time.Now()
 
 		for i, _ := range rf.peers {
+			if i == rf.me {
+				continue
+			}
+
 			args := AppendEntriesArgs{
 				Term:         rf.term,
 				LeaderId:     rf.me,
 				PrevLogIndex: rf.nextIndex[i] - 1,
 				PrevLogTerm:  rf.log[rf.nextIndex[i]-1].Term,
-				Entries:      []Log{},
+				// Entries:      rf.log[rf.nextIndex[i]:],
 				LeaderCommit: rf.commitIndex,
 			}
+			if len(rf.log) <= rf.nextIndex[i] {
+				args.Entries = []Log{}
+
+			} else {
+				entries := make([]Log, len(rf.log[rf.nextIndex[i]:]))
+				copy(entries, rf.log[rf.nextIndex[i]:])
+				args.Entries = entries
+			}
+			length := len(rf.log)
 			// DPrintfln("[W]", ColorYellow, "send AppendEntriesArgs ok next:%d", rf.nextIndex[i])
 			reply := AppendEntriesReply{}
-			go func(i int, args AppendEntriesArgs, reply AppendEntriesReply) {
+			go func(i int, args AppendEntriesArgs, reply AppendEntriesReply, lenght int) {
 
 				ok := rf.SendAppendEntries(i, &args, &reply)
 				rf.lock_.Lock()
 				if ok {
-					//DPrintfln("[W]", ColorYellow, "send AppendEntriesArgs ok ")
-
 					if reply.Term > rf.term {
 
 						rf.term = reply.Term
 						rf.state = Follower
 						rf.votedFor = -1
+						rf.persist()
 						rf.lock_.Unlock()
 						return
 					}
-
 					if !reply.Success {
-						rf.nextIndex[i] = maxInt(1, rf.nextIndex[i]-1)
+						switch {
+						case reply.XLen != -1:
+							rf.nextIndex[i] = minInt(reply.XLen, len(rf.log))
+						case reply.XTerm != -1:
+							pos := rf.BinarySearch(reply.XTerm)
+							if pos < 0 {
+								rf.nextIndex[i] = minInt(reply.XIndex, len(rf.log))
+							} else {
+								rf.nextIndex[i] = minInt(pos, len(rf.log))
+							}
+						default:
+							rf.nextIndex[i] = maxInt(1, rf.nextIndex[i]-1)
+						}
 					} else {
+						rf.nextIndex[i] = lenght
 						rf.matchIndex[i] = rf.nextIndex[i] - 1
 					}
-
 				}
 				rf.lock_.Unlock()
-			}(i, args, reply)
+			}(i, args, reply, length)
 		}
 		rf.lock_.Unlock()
 
@@ -510,12 +570,27 @@ func (rf *Raft) startLearder() {
 }
 
 func (rf *Raft) SendAppendEntries(i int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
-	if i == rf.me {
-		return false
-	}
+
 	ok := rf.peers[i].Call("Raft.AppendEntries", args, reply)
 	return ok
 }
+func (rf *Raft) BinarySearch(Xterm int) int {
+	l, r := 0, len(rf.log)
+	for l < r {
+		mid := l + (r-l)/2
+		if rf.log[mid].Term <= Xterm {
+			l = mid + 1
+		} else {
+			r = mid
+		}
+	}
+
+	if l > 0 && rf.log[l-1].Term == Xterm {
+		return l
+	}
+	return -1
+}
+
 func minInt(a, b int) int {
 	if a < b {
 		return a
@@ -532,6 +607,15 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	//DPrintfln("[C]", ColorBlue, "   receive .  ppendEntries \n")
 	rf.lock_.Lock()
 	rf.time_ = time.Now()
+	reply.XIndex = -1
+	reply.XLen = -1
+	reply.XTerm = -1
+	if args.Term > rf.term {
+		rf.term = args.Term
+		rf.state = Follower
+		rf.votedFor = -1
+		rf.persist()
+	}
 	if args.Term < rf.term {
 		reply.Success = false
 		reply.Term = rf.term
@@ -542,18 +626,26 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	if log_index < args.PrevLogIndex || rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
 		// DPrintfln("[W]", ColorRed, "receive log not matched myname:%d mylog_index:%d mylog_last_term:%d, receive_name:%d, receive_index:%d  , receive_last_term:%d\n", rf.me, log_index, rf.log[args.PrevLogIndex].Term, args.LeaderId, args.PrevLogIndex, args.PrevLogTerm)
+
 		reply.Success = false
 		reply.Term = rf.term
+		if len(rf.log) <= args.PrevLogIndex {
+			reply.XLen = len(rf.log)
+		} else {
+			reply.XTerm = rf.log[args.PrevLogIndex].Term
+			index := args.PrevLogIndex
+			for index > 0 && rf.log[index-1].Term == reply.XTerm {
+				index--
+			}
+			reply.XIndex = index
+		}
+
 		rf.lock_.Unlock()
 		return
 	}
+
 	if len(args.Entries) == 0 {
 
-		if args.Term > rf.term {
-			rf.votedFor = -1
-		}
-		rf.term = args.Term
-		rf.state = Follower
 		reply.Term = rf.term
 
 		reply.Success = true
@@ -574,6 +666,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 		}
 		//DPrintfln("[b]", ColorGreen, "receive log matched myname:%d myloglen%d\n", rf.me, len(rf.log))
+		rf.persist()
 
 		reply.Success = true
 
@@ -589,7 +682,7 @@ func (rf *Raft) pushToFollowers() {
 
 	go func() {
 		for {
-			time.Sleep(10 * time.Millisecond)
+			time.Sleep(50 * time.Millisecond)
 			rf.lock_.Lock()
 			if len(rf.log)-1 <= rf.commitIndex {
 				rf.lock_.Unlock()
@@ -602,8 +695,8 @@ func (rf *Raft) pushToFollowers() {
 			for N := len(rf.log) - 1; N > rf.commitIndex; N-- {
 				n := 1
 
-				for _, value := range rf.matchIndex {
-					if value >= N {
+				for i, value := range rf.matchIndex {
+					if value >= N && i != rf.me {
 						n++
 					}
 				}
@@ -619,80 +712,102 @@ func (rf *Raft) pushToFollowers() {
 		}
 
 	}()
-	for i, _ := range rf.peers {
-		if i == rf.me {
-			continue
-		}
-		go func(i int) {
-			for {
+	// for i, _ := range rf.peers {
+	// 	if i == rf.me {
+	// 		continue
+	// 	}
+	// 	go func(i int) {
+	// 		for {
 
-				time.Sleep(10 * time.Millisecond)
+	// 			time.Sleep(20 * time.Millisecond)
 
-				rf.lock_.Lock()
-				if len(rf.log)-1 < rf.nextIndex[i] {
-					rf.lock_.Unlock()
-					continue
-				}
-				if rf.killed() || rf.state != Leader {
-					rf.lock_.Unlock()
-					return
-				}
-				args := AppendEntriesArgs{
-					Term:         rf.term,
-					LeaderId:     rf.me,
-					PrevLogIndex: rf.nextIndex[i] - 1,
-					PrevLogTerm:  rf.log[rf.nextIndex[i]-1].Term,
-					Entries:      rf.log[rf.nextIndex[i]:],
-					LeaderCommit: rf.commitIndex,
-				}
-				send_index := len(rf.log)
+	// 			rf.lock_.Lock()
+	// 			if len(rf.log)-1 < rf.nextIndex[i] {
+	// 				rf.lock_.Unlock()
+	// 				continue
+	// 			}
+	// 			if rf.killed() || rf.state != Leader {
+	// 				rf.lock_.Unlock()
+	// 				return
+	// 			}
+	// 			args := AppendEntriesArgs{
+	// 				Term:         rf.term,
+	// 				LeaderId:     rf.me,
+	// 				PrevLogIndex: rf.nextIndex[i] - 1,
+	// 				PrevLogTerm:  rf.log[rf.nextIndex[i]-1].Term,
+	// 				Entries:      rf.log[rf.nextIndex[i]:],
+	// 				LeaderCommit: rf.commitIndex,
+	// 			}
+	// 			send_index := len(rf.log)
 
-				// DPrintfln("[W]", ColorYellow, "name:%v  len  %v . now nextindex:%d\n", rf.me, len(args.Entries), rf.nextIndex[i])
-				reply := AppendEntriesReply{}
-				rf.lock_.Unlock()
-				ok := rf.SendAppendEntries(i, &args, &reply)
-				if ok {
-					rf.lock_.Lock()
-					if reply.Term > rf.term {
-						rf.term = reply.Term
-						rf.state = Follower
-						rf.votedFor = -1
-						rf.lock_.Unlock()
-						return
-					} else if reply.Success == false {
+	// 			// DPrintfln("[W]", ColorYellow, "name:%v  len  %v . now nextindex:%d\n", rf.me, len(args.Entries), rf.nextIndex[i])
+	// 			reply := AppendEntriesReply{}
+	// 			rf.lock_.Unlock()
+	// 			ok := rf.SendAppendEntries(i, &args, &reply)
+	// 			if ok {
+	// 				rf.lock_.Lock()
+	// 				if reply.Term > rf.term {
+	// 					rf.term = reply.Term
+	// 					rf.state = Follower
+	// 					rf.votedFor = -1
+	// 					rf.persist()
+	// 					rf.lock_.Unlock()
+	// 					return
+	// 				} else if reply.Success == false {
 
-						rf.nextIndex[i] = maxInt(1, rf.nextIndex[i]-1)
-						// DPrintfln("[F]", ColorRed, "  receive fail name:%d    now nextindex:%d \n", i, rf.nextIndex[i])
-					} else {
-						// DPrintfln("[A]", ColorBlue, "receive ok name:%d    index:%d \n", i, send_index)
-						rf.nextIndex[i] = send_index
-						rf.matchIndex[i] = rf.nextIndex[i] - 1
+	// 					switch {
+	// 					case reply.XLen != -1:
+	// 						rf.nextIndex[i] = reply.XLen
+	// 					case reply.XTerm != -1:
+	// 						pos := rf.BinarySearch(reply.XTerm)
+	// 						if pos < 0 {
+	// 							rf.nextIndex[i] = reply.XIndex
+	// 						} else {
+	// 							rf.nextIndex[i] = pos
+	// 						}
+	// 					default:
+	// 						rf.nextIndex[i] = maxInt(1, rf.nextIndex[i]-1)
+	// 					}
+	// 					// DPrintfln("[F]", ColorRed, "  receive fail name:%d    now nextindex:%d \n", i, rf.nextIndex[i])
+	// 				} else {
+	// 					// DPrintfln("[A]", ColorBlue, "receive ok name:%d    index:%d \n", i, send_index)
+	// 					rf.nextIndex[i] = send_index
+	// 					rf.matchIndex[i] = rf.nextIndex[i] - 1
 
-					}
-					rf.lock_.Unlock()
+	// 				}
+	// 				rf.lock_.Unlock()
 
-				}
-			}
-		}(i)
+	// 			}
+	// 		}
+	// 	}(i)
 
-	}
+	// }
 
 }
 
 func (rf *Raft) ReachToCommit() {
-	for rf.killed() == false {
+	for {
 		time.Sleep(10 * time.Millisecond)
 		rf.lock_.Lock()
+		if rf.killed() {
+			rf.lock_.Unlock()
+			return
+		}
 		if rf.lastApplied < rf.commitIndex {
+			if rf.killed() {
+				rf.lock_.Unlock()
+				return
+			}
 			rf.lastApplied++
-			// DPrintfln("[W]", ColorYellow, "push success name:%d    index:%d   cmd:%v\n", rf.me, rf.lastApplied, rf.log[rf.lastApplied].Cmd)
+			DPrintfln("[W]", ColorYellow, "push success name:%d    index:%d   cmd:%v\n", rf.me, rf.lastApplied, rf.log[rf.lastApplied].Cmd)
 			// DPrintfln("[W]", ColorYellow, "push success name:%d    index:%d   \n", rf.me, rf.lastApplied)
-
 			msg := raftapi.ApplyMsg{
 				CommandValid: true,
 				Command:      rf.log[rf.lastApplied].Cmd,
 				CommandIndex: rf.lastApplied}
+			rf.lock_.Unlock()
 			rf.applyCh <- msg
+			continue
 		}
 		rf.lock_.Unlock()
 	}
